@@ -86,7 +86,13 @@ typedef struct {
     int index_topk, index_nh, index_hd;          /* DSA lightning indexer */
     int8_t idx_type[128];                        /* per layer: 1=full (calcola), 0=shared (riusa) */
     float eps, theta, attn_scale, routed_scale;
+    /* --- mistral4 arch branch (default 0 = glm_moe_dsa, engine unchanged) --- */
+    int arch;                    /* 0=glm_moe_dsa, 1=mistral4 */
+    float yarn_inv[128];         /* precomputed YaRN inv_freq[half=qk_rope/2] (mistral4 rope) */
+    float yarn_ascale;           /* YaRN cos/sin post-scale (mscale-derived, 1.0 here) */
+    float llama4_beta; int orig_max;   /* llama4 attn-scale: q *= 1+beta*ln(1+floor(pos/orig_max)) */
 } Cfg;
+enum { ARCH_GLM=0, ARCH_MISTRAL4=1 };
 
 /* tensore [O,I] in uno di tre formati:
  *   fmt=0 F32   -> qf
@@ -976,9 +982,11 @@ static void rope_interleave(float *v, int pos, const Cfg *c){
     static _Thread_local RopeCache cache;
     float in[256]; memcpy(in,v,c->qk_rope*sizeof(float));
     if(!cache.valid||cache.pos!=pos||cache.qk!=c->qk_rope||cache.theta!=c->theta){
+        float asc=(c->arch==ARCH_MISTRAL4)?c->yarn_ascale:1.f;
         for(int j=0;j<half;j++){
-            float inv=powf(c->theta,-2.0f*j/c->qk_rope),ang=pos*inv;
-            cache.cs[j]=cosf(ang); cache.sn[j]=sinf(ang);
+            float inv=(c->arch==ARCH_MISTRAL4)?c->yarn_inv[j]:powf(c->theta,-2.0f*j/c->qk_rope);
+            float ang=pos*inv;
+            cache.cs[j]=cosf(ang)*asc; cache.sn[j]=sinf(ang)*asc;
         }
         cache.pos=pos; cache.qk=c->qk_rope; cache.theta=c->theta; cache.valid=1;
     }
@@ -1015,6 +1023,35 @@ static void load_cfg(Cfg *c, const char *snap){
     jval *rs=json_get(r,"routed_scaling_factor"); c->routed_scale=rs?(float)rs->num:1.f;
     jval *rp=json_get(r,"rope_parameters"); jval *th=rp?json_get(rp,"rope_theta"):NULL;
     c->theta = th?(float)th->num:10000.f;
+    /* --- mistral4 arch detection + YaRN precompute (glm path untouched) --- */
+    { jval *mt=json_get(r,"model_type");
+      c->arch = (mt&&mt->str&&(!strcmp(mt->str,"mistral4")||!strcmp(mt->str,"mistral3"))) ? ARCH_MISTRAL4 : ARCH_GLM; }
+    c->yarn_ascale=1.f; c->llama4_beta=0.f; c->orig_max=0;
+    if(c->arch==ARCH_MISTRAL4 && rp){
+        #define JGD(k,d) ({ jval *v=json_get(rp,k); v&&v->t==J_NUM ? v->num : (double)(d); })
+        double base=c->theta, factor=JGD("factor",1.0);
+        double bf=JGD("beta_fast",32.0), bs=JGD("beta_slow",1.0);
+        double omax=JGD("original_max_position_embeddings",0.0);
+        int dim=c->qk_rope, half=dim/2;
+        double lo=floor( dim*log(omax/(bf*2.0*M_PI)) / (2.0*log(base)) );
+        double hi=ceil(  dim*log(omax/(bs*2.0*M_PI)) / (2.0*log(base)) );
+        if(lo<0) lo=0;
+        if(hi>dim-1) hi=dim-1;
+        for(int j=0;j<half && j<128;j++){
+            double pf=pow(base,(double)(2*j)/dim), extrap=1.0/pf, interp=1.0/(factor*pf);
+            double denom=(hi==lo)?(hi+0.001-lo):(hi-lo), ramp=(j-lo)/denom;
+            if(ramp<0) ramp=0;
+            if(ramp>1) ramp=1;
+            double ef=1.0-ramp;
+            c->yarn_inv[j]=(float)(interp*(1.0-ef)+extrap*ef);
+        }
+        double ms=JGD("mscale",1.0), msa=JGD("mscale_all_dim",1.0), gm=1.0, gd=1.0;
+        if(factor>1.0){ gm=0.1*ms*log(factor)+1.0; gd=0.1*msa*log(factor)+1.0; }
+        c->yarn_ascale=(float)(gm/gd);
+        c->llama4_beta=(float)JGD("llama_4_scaling_beta",0.0);
+        c->orig_max=(int)omax;
+        #undef JGD
+    }
     /* token di stop: GLM-5.2 ne ha TRE (endoftext, user, observation). Fermarsi solo sul
      * primo = generare spazzatura invisibile dopo la fine del turno (5-10x token sprecati). */
     c->n_stop=0;
@@ -1162,7 +1199,7 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
             l->down_proj = qt_load(m,P("mlp.down_proj.weight"), D, c->dense_inter, dbits);
         } else {
             l->router=ld(m,P("mlp.gate.weight"));
-            l->router_bias=ld(m,P("mlp.gate.e_score_correction_bias"));
+            l->router_bias=(c->arch==ARCH_MISTRAL4)?NULL:ld(m,P("mlp.gate.e_score_correction_bias"));
             int sI=c->moe_inter*c->n_shared;
             l->sh_gate = qt_load(m,P("mlp.shared_experts.gate_proj.weight"), sI, D, dbits);
             l->sh_up   = qt_load(m,P("mlp.shared_experts.up_proj.weight"),   sI, D, dbits);
@@ -1854,6 +1891,10 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         int pos=positions?positions[s]:pos_base+s;
         float *qfull=Q+(int64_t)s*H*qh;
         for(int h=0;h<H;h++) rope_interleave(qfull+(int64_t)h*qh+c->qk_nope, pos, c);
+        if(c->arch==ARCH_MISTRAL4 && c->orig_max>0){    /* llama4 attn-scale on full query */
+            float l4=1.f+c->llama4_beta*logf(1.f+floorf((float)pos/c->orig_max));
+            for(int i=0;i<H*qh;i++) qfull[i]*=l4;
+        }
         const float *cs=comp+(int64_t)s*cw;
         float *Ldst=coli_kv_row(ks->Lc[layer],pos,c->kv_lora);
         float *Rdst=coli_kv_row(ks->Rc[layer],pos,c->qk_rope);
@@ -2159,6 +2200,10 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
     if(!pre_routed)
     for(int s=0;s<S;s++){
         float *logit=logits_all+(int64_t)s*E;
+        if(c->arch==ARCH_MISTRAL4){
+            softmax(logit,E);                          /* softmax scores over experts (mistral4) */
+            for(int e=0;e<E;e++) choice[e]=logit[e];   /* no e_score_correction_bias */
+        } else
         for(int e=0;e<E;e++){ logit[e]=sigmoidf(logit[e]); choice[e]=logit[e]+l->router_bias[e]; }
         int *idx=idxs+(int64_t)s*K; float *w=ws+(int64_t)s*K;
         int Ksel = g_topk>0 ? (g_topk<K?g_topk:K) : K;
