@@ -63,3 +63,7 @@ c/bench/
 c/tests/test_decode_batch
 c/tests/test_i4_acc512
 c/tests/test_idot
+c/qwen3moe
+c/qwen3moe_p
+c/tests/q6probe
+c/tests/bw
