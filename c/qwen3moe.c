@@ -48,6 +48,7 @@
 #include "json.h"
 #include "st.h"
 #include "notorch.h"      /* vendored: nt_qmatvec packed Q6_K */
+#include "qwen_tok.h"     /* Qwen byte-level BPE, schema read from tokenizer.json */
 
 #define GGUF_Q6_K 14      /* GGUF type code; the container states it in config.json */
 
@@ -813,6 +814,84 @@ static void run_bench(Model *m, int ntok){
     kv_free(m); free(last); free(pre); free(seq);
 }
 
+/* ---------- gen: prompt -> greedy continuation, streamed as text ----------
+ * Raw continuation on purpose: the body is a BASE model, so no chat template is applied
+ * and tokenizer.json's post_processor is deliberately left unread. Wrapping base weights
+ * in <|im_start|> turns would fake an instruct model we do not have. */
+static void run_gen(Model *m, const char *snap, const char *prompt, int ntok){
+    Cfg *c=&m->c;
+    char tj[1200]; snprintf(tj,sizeof tj,"%s/tokenizer.json",snap);
+    QTok T; qtok_load(&T,tj);
+    int cap=1<<16; int *ids=malloc((size_t)cap*sizeof(int));
+    int n=qtok_encode(&T,prompt,(int)strlen(prompt),ids,cap);
+    if(n<1){ fprintf(stderr,"gen: prompt encodes to nothing\n"); exit(1); }
+    fprintf(stderr,"gen: prompt %d tok, generating %d\n",n,ntok);
+    kv_alloc(m,n+ntok+2);
+    float *last=falloc(c->vocab);
+    step(m,ids,n,0,last,0);
+    int *out=malloc((size_t)(ntok>0?ntok:1)*sizeof(int));
+    char piece[64];
+    fputs(prompt,stdout); fflush(stdout);
+    for(int i=0;i<ntok;i++){
+        int nx=argmax(last,c->vocab); out[i]=nx;
+        int l=qtok_decode(&T,&nx,1,piece,(int)sizeof piece-1);
+        fwrite(piece,1,l,stdout); fflush(stdout);   /* byte-level: pieces concatenate exactly */
+        step(m,&nx,1,n+i,last,0);
+    }
+    fputc('\n',stdout);
+    fprintf(stderr,"gen first 16 ids:");
+    for(int i=0;i<16&&i<ntok;i++) fprintf(stderr," %d",out[i]);
+    fprintf(stderr,"\n");
+    kv_free(m); free(last); free(ids); free(out);
+}
+
+/* ---------- ppl: teacher-forcing NLL, llama-perplexity window ----------
+ * Their canon (perplexity.cpp, stride 0): the token stream is cut into non-overlapping
+ * chunks of n_ctx (default 512), each chunk is evaluated in one pass, and the loss is
+ * summed over positions 1..n_ctx-1 — the first token of a chunk has no prediction, so a
+ * chunk contributes n_ctx-1 terms. PPL = exp(sum NLL / count).
+ * NLL accumulates in float64 and log-sum-exp is computed in float64: at ~150k logits per
+ * position and hundreds of thousands of terms, f32 accumulation drifts (the cos>1 lesson). */
+static void run_ppl(Model *m, const char *snap, const char *path, int nctx, int maxchunks){
+    Cfg *c=&m->c;
+    char tj[1200]; snprintf(tj,sizeof tj,"%s/tokenizer.json",snap);
+    QTok T; qtok_load(&T,tj);
+    long fsz=0; char *text=qtk_read_file(path,&fsz);
+    int cap=(int)(fsz+16); int *ids=malloc((size_t)cap*sizeof(int));
+    double t_tok=now_s();
+    int ntok=qtok_encode(&T,text,(int)fsz,ids,cap);
+    t_tok=now_s()-t_tok;
+    int nchunk=ntok/nctx;
+    if(maxchunks>0 && nchunk>maxchunks) nchunk=maxchunks;
+    if(nchunk<1){ fprintf(stderr,"ppl: %d tokens is less than one %d-token chunk\n",ntok,nctx); exit(1); }
+    fprintf(stderr,"ppl: %ld bytes -> %d tokens in %.1fs | ctx %d | chunks %d (of %d available)\n",
+            fsz,ntok,t_tok,nctx,nchunk,ntok/nctx);
+    kv_alloc(m,nctx+2);
+    float *lg=falloc((int64_t)nctx*c->vocab);
+    double nll=0.0; long count=0;
+    double t0=now_s();
+    for(int ch=0; ch<nchunk; ch++){
+        const int *win=ids+(size_t)ch*nctx;
+        kv_free(m); kv_alloc(m,nctx+2);            /* each chunk is independent context */
+        step(m,win,nctx,0,lg,1);
+        for(int i=0;i+1<nctx;i++){
+            const float *row=lg+(size_t)i*c->vocab;
+            int tgt=win[i+1];
+            double mx=-1e300;
+            for(int v=0;v<c->vocab;v++) if(row[v]>mx) mx=row[v];
+            double se=0.0;
+            for(int v=0;v<c->vocab;v++) se+=exp((double)row[v]-mx);
+            nll += -((double)row[tgt]-mx-log(se));
+            count++;
+        }
+        fprintf(stderr,"  chunk %d/%d  ppl so far %.4f  (%.1fs)\n",
+                ch+1,nchunk,exp(nll/(double)count),now_s()-t0);
+    }
+    printf("ppl: %s | ctx %d | chunks %d | tokens scored %ld | NLL %.6f | PPL %.4f\n",
+           path,nctx,nchunk,count,nll/(double)count,exp(nll/(double)count));
+    kv_free(m); free(lg); free(ids); free(text);
+}
+
 int main(int argc, char **argv){
     const char *snap=getenv("SNAP");
     if(!snap){ fprintf(stderr,"set SNAP=<container dir>\n"); return 1; }
@@ -824,7 +903,10 @@ int main(int argc, char **argv){
       if((e=getenv("EXPERT_DROP"))) g_expert_drop=atoi(e);
       if((e=getenv("ATTN_IDOT")))   g_attn_idot=atoi(e);
       if((e=getenv("HEAD_IDOT")))   g_head_idot=atoi(e); }
-    if(argc<3){ fprintf(stderr,"usage: SNAP=<dir> %s ref <ref.json> [cap] | bench <ntok> [cap]\n",argv[0]); return 1; }
+    if(argc<3){ fprintf(stderr,"usage: SNAP=<dir> %s ref <ref.json> [cap] | bench <ntok> [cap]\n"
+                               "       SNAP=<dir> %s gen \"<prompt>\" [ntok]\n"
+                               "       SNAP=<dir> %s ppl <textfile> [ctx=512] [maxchunks=all]\n",
+                       argv[0],argv[0],argv[0]); return 1; }
     const char *mode=argv[1];
     int cap = argc>3 ? atoi(argv[3]) : 0;
 
@@ -840,6 +922,9 @@ int main(int argc, char **argv){
     int rc=0;
     if(!strcmp(mode,"ref"))       rc=run_ref(&m, argv[2]);
     else if(!strcmp(mode,"bench"))run_bench(&m, atoi(argv[2]));
+    else if(!strcmp(mode,"gen"))  run_gen(&m, snap, argv[2], argc>3?atoi(argv[3]):64);
+    else if(!strcmp(mode,"ppl"))  run_ppl(&m, snap, argv[2], argc>3?atoi(argv[3]):512,
+                                          argc>4?atoi(argv[4]):0);
     else { fprintf(stderr,"unknown mode %s\n",mode); rc=1; }
     return rc;
 }

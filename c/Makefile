@@ -250,6 +250,10 @@ qwen3moe$(EXE): qwen3moe.c st.h json.h compat.h $(NOTORCH_DIR)/notorch.o
 tests/q6probe$(EXE): tests/q6probe.c st.h json.h $(NOTORCH_DIR)/notorch.o
 	$(CC) $(CFLAGS) -I$(NOTORCH_DIR) -I. tests/q6probe.c $(NOTORCH_DIR)/notorch.o -o $@ $(LDFLAGS) -lpthread
 
+# Qwen BPE parity harness: diffed line-by-line against llama-tokenize (see T4b).
+tests/qwen_tok_test$(EXE): tests/qwen_tok_test.c qwen_tok.h json.h tok_unicode.h
+	$(CC) $(CFLAGS) -I. tests/qwen_tok_test.c -o $@ $(LDFLAGS)
+
 tests/bw$(EXE): tests/bw.c
 	$(CC) $(CFLAGS) tests/bw.c -o $@ $(LDFLAGS) -lpthread
 
