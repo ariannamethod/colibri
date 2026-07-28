@@ -232,6 +232,33 @@ cuda-bench: backend_cuda.cu backend_cuda.h tests/bench_tensor_core.cu
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
 
+# --- qwen3moe (Arianna body: Qwen3-30B-A3B-Base) ---
+# The Q6_K lm_head is multiplied by notorch's packed kernel (nt_qmatvec, GGUF dtype 14),
+# so notorch is VENDORED into this tree: the build resolves it under vendor/notorch and
+# never reaches outside this repository. Re-syncing the vendor copy is a plain file copy.
+NOTORCH_DIR = vendor/notorch
+
+$(NOTORCH_DIR)/notorch.o: $(NOTORCH_DIR)/notorch.c $(NOTORCH_DIR)/notorch.h
+	$(CC) $(CFLAGS) -I$(NOTORCH_DIR) -c $(NOTORCH_DIR)/notorch.c -o $@
+
+qwen3moe$(EXE): qwen3moe.c st.h json.h compat.h $(NOTORCH_DIR)/notorch.o
+	$(CC) $(CFLAGS) -I$(NOTORCH_DIR) qwen3moe.c $(NOTORCH_DIR)/notorch.o -o qwen3moe$(EXE) $(LDFLAGS) -lpthread
+
+# T5c gate probes. q6probe: does the engine kernel (nt_qmatvec dtype 14) read our packed
+# Q6_K head the same way the reference decoder does, and what does the head cost per token.
+# bw: pure warm-page-cache streaming bandwidth, the ceiling every tempo claim divides by.
+tests/q6probe$(EXE): tests/q6probe.c st.h json.h $(NOTORCH_DIR)/notorch.o
+	$(CC) $(CFLAGS) -I$(NOTORCH_DIR) -I. tests/q6probe.c $(NOTORCH_DIR)/notorch.o -o $@ $(LDFLAGS) -lpthread
+
+tests/bw$(EXE): tests/bw.c
+	$(CC) $(CFLAGS) tests/bw.c -o $@ $(LDFLAGS) -lpthread
+
+# wiring-parity twin: dense scalar double accumulate, numerically identical to the T2 gate
+qwen3moe_p$(EXE): qwen3moe.c st.h json.h compat.h $(NOTORCH_DIR)/notorch.c $(NOTORCH_DIR)/notorch.h
+	$(CC) -O2 -DACC_DOUBLE -I$(NOTORCH_DIR) -Wall -Wextra -Wno-unused-parameter \
+	  -Wno-misleading-indentation -Wno-unused-function -Wno-unknown-pragmas \
+	  qwen3moe.c $(NOTORCH_DIR)/notorch.c -o qwen3moe_p$(EXE) -lm -lpthread
+
 # binario portabile da distribuire su altre macchine x86-64
 portable:
 	$(MAKE) glm$(EXE) ARCH=x86-64-v3
