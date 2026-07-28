@@ -9,11 +9,31 @@
 #include <math.h>
 #include <stdint.h>
 #include <time.h>
+#include <pthread.h>
 #include "json.h"
 #include "st.h"
 #include "notorch.h"
 
 static int amax_i(const float *v,int n){int b=0;for(int i=1;i<n;i++)if(v[i]>v[b])b=i;return b;}
+
+static double now_ms(void){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t);
+    return t.tv_sec*1e3 + t.tv_nsec/1e6; }
+
+/* T5e step 0: what the 23.19 ms/tok head actually consists of, measured not guessed.
+ * Thread spawn is timed as the consumer pays it — six pthreads created and joined per
+ * call — and the row hand-out is probed by comparing the threaded call against the same
+ * call forced single-threaded (NT_QMV_THREAD_MIN is read once and cached, so the floor
+ * must be set in the environment before the first call). */
+static void *noop_worker(void *p){ (void)p; return NULL; }
+static double spawn_cost_ms(int nthr, int reps){
+    double t0=now_ms();
+    for(int r=0;r<reps;r++){
+        pthread_t th[16];
+        for(int t=0;t<nthr;t++) pthread_create(&th[t],NULL,noop_worker,NULL);
+        for(int t=0;t<nthr;t++) pthread_join(th[t],NULL);
+    }
+    return (now_ms()-t0)/reps;
+}
 
 int main(int argc,char**argv){
     if(argc<5){fprintf(stderr,"usage: q6probe <f32_dir> <q6_dir> <O> <I>\n");return 2;}
@@ -59,6 +79,24 @@ int main(int argc,char**argv){
                t,rel,mx,cos,a1,a2,a1==a2?"":"<-- FLIP");
     }
     printf("argmax agreement %d/%d | worst relL1 %.6f\n",agree,trials,worst);
+
+    /* ---- phase breakdown of the head matvec ---- */
+    {
+        const int REP=10;
+        double t0,f32_ms=0,i8_ms=0;
+        for(int r=0;r<REP;r++){ t0=now_ms(); nt_qmatvec(yq,Q,14,x,O,I);    f32_ms+=now_ms()-t0; }
+        for(int r=0;r<REP;r++){ t0=now_ms(); nt_qmatvec_i8(yq,Q,14,x,O,I); i8_ms+=now_ms()-t0; }
+        f32_ms/=REP; i8_ms/=REP;
+        double sp6=spawn_cost_ms(6,200), sp1=spawn_cost_ms(1,200);
+        const char *floor_env=getenv("NT_QMV_THREAD_MIN");
+        printf("\nHEAD PHASE BREAKDOWN (O=%d I=%d, %d reps, NT_QMV_THREAD_MIN=%s)\n",
+               O,I,REP, floor_env?floor_env:"default 4M");
+        printf("  nt_qmatvec    (f32 act) : %7.3f ms  -> %5.2f GB/s\n", f32_ms, (double)nb/(f32_ms/1e3)/1e9);
+        printf("  nt_qmatvec_i8 (int8 act): %7.3f ms  -> %5.2f GB/s\n", i8_ms,  (double)nb/(i8_ms/1e3)/1e9);
+        printf("  pthread spawn+join x6   : %7.3f ms  (%.1f%% of the i8 call)\n", sp6, 100.0*sp6/i8_ms);
+        printf("  pthread spawn+join x1   : %7.3f ms\n", sp1);
+        printf("  activation quant k=%d   : below timer resolution here; it is O(k)=%d ops\n", I, I);
+    }
     printf("nt_qmatvec head cost: mean %.2f ms  min %.2f ms  -> %.2f GB/s effective over %lld B\n",
            tsum/trials, tmin, (double)nb/(tmin/1e3)/1e9, (long long)nb);
     return 0;

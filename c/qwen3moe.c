@@ -249,13 +249,16 @@ static int g_expert_drop=0;
  * profile puts qkv 17.4 + o_proj 12.9 = 30.3 ms/tok there, the second-largest block after
  * the experts. ATTN_IDOT=1 turns on int8-activation integer dot for q/k/v/o; the isolation
  * probes below decide whether it stays on. */
-static int g_attn_idot=0;
+/* Default ON since T5e (Oleg's word): the probes that gated it are green and repeated —
+ * tiny256_t5c 24/30 against 23/30 exact, 30B ids identical. ATTN_IDOT=0 still selects the
+ * exact path for side-by-side checks. */
+static int g_attn_idot=1;
 /* T5d move 5. The Q6_K head ran through nt_qmatvec (f32 activation, exact): 27.42 ms/tok
  * at 9.3 GB/s, the worst efficiency in the decode. nt_qmatvec_i8 now carries dtype 14, so
  * HEAD_IDOT=1 routes the head through the int8-activation integer dot instead. This DOES
  * change the head's arithmetic (the activation is quantized per 32), unlike the fused
  * moves — so it ships behind a flag and the tiny pair is read flip-by-flip. */
-static int g_head_idot=0;
+static int g_head_idot=1;
 static int g_idot=1, g_i4s=2, g_expert_idot=1;   /* expert idot default ON: measured +21% at S=1
                                                     on polygon AVX2 (5.88->7.13), unlike glm's S>=2
                                                     default; EXPERT_IDOT=0 restores exact experts. */
