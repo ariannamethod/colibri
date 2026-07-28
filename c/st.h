@@ -97,6 +97,24 @@ static int st_direct_fd(shards *S, int fd) {
     return -1;
 }
 
+static const char *st_path_of_fd(shards *S, int fd) {
+    for (int i = 0; i < S->nfd; i++) if (S->fds[i] == fd) return S->paths[i];
+    return "?";
+}
+
+/* pread completa o muore. Una lettura corta (0 <= r < n: shard troncato) NON e' un
+ * errore di syscall e non tocca errno, quindi perror() qui stampava un motivo falso
+ * ("Success" / l'errno stantio di una chiamata precedente). Solo r < 0 e' un vero
+ * errore di syscall e resta perror. */
+static void st_pread_exact(int fd, void *buf, int64_t n, int64_t off, const char *what, const char *path) {
+    ssize_t r = pread(fd, buf, (size_t)n, (off_t)off);
+    if (r == (ssize_t)n) return;
+    if (r < 0) perror(what);
+    else fprintf(stderr, "%s: short read: got %lld of %lld bytes at offset %lld (file %s)\n",
+                 what, (long long)r, (long long)n, (long long)off, path);
+    exit(1);
+}
+
 /* indicizza tutti i model-*.safetensors in snap_dir */
 static void st_init(shards *S, const char *snap_dir) {
     memset(S, 0, sizeof(*S));
@@ -119,9 +137,9 @@ static void st_init(shards *S, const char *snap_dir) {
     for (int fi = 0; fi < nf; fi++) {
         int fd = st_open_fd(S, files[fi]);
         uint64_t hlen;
-        if (pread(fd, &hlen, 8, 0) != 8) { perror("pread hlen"); exit(1); }
+        st_pread_exact(fd, &hlen, 8, 0, "pread hlen", files[fi]);
         char *hdr = malloc(hlen + 1);
-        if (pread(fd, hdr, hlen, 8) != (ssize_t)hlen) { perror("pread hdr"); exit(1); }
+        st_pread_exact(fd, hdr, (int64_t)hlen, 8, "pread hdr", files[fi]);
         hdr[hlen] = 0;
         int64_t data_start = 8 + (int64_t)hlen;
         char *arena = NULL;
@@ -184,7 +202,7 @@ static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
     void *raw = malloc(t->nbytes);
-    if (pread(t->fd, raw, t->nbytes, t->off) != t->nbytes) { perror("pread data"); exit(1); }
+    st_pread_exact(t->fd, raw, t->nbytes, t->off, "pread data", st_path_of_fd(S, t->fd));
     if (t->dtype == 2) {
         memcpy(out, raw, t->nbytes);
     } else if (t->dtype == 0) {
@@ -209,7 +227,7 @@ static int64_t st_nbytes(shards *S, const char *name) {
 static void st_read_raw(shards *S, const char *name, void *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
-    if (pread(t->fd, out, t->nbytes, t->off) != t->nbytes) { perror("pread raw"); exit(1); }
+    st_pread_exact(t->fd, out, t->nbytes, t->off, "pread raw", st_path_of_fd(S, t->fd));
     if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
 }
 
@@ -222,7 +240,7 @@ static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int
     int esz = (t->dtype == 2) ? 4 : 2;
     int64_t boff = t->off + elem_off * esz, nb = n_elems * esz;
     void *raw = malloc(nb);
-    if (pread(t->fd, raw, nb, boff) != nb) { perror("pread slice"); exit(1); }
+    st_pread_exact(t->fd, raw, nb, boff, "pread slice", st_path_of_fd(S, t->fd));
     if (t->dtype == 2) memcpy(out, raw, nb);
     else if (t->dtype == 0) { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = bf16_to_f32(p[i]); }
     else { uint16_t *p = raw; for (int64_t i = 0; i < n_elems; i++) out[i] = f16_to_f32(p[i]); }
