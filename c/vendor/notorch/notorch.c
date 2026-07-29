@@ -5240,6 +5240,19 @@ static nt_qrows_fn nt_qrows_for(int dtype, int k) {
 }
 
 #define NT_QMV_MAX_THREADS 16
+#define NT_QMV_ASUM_MAX   2048   /* k <= 65536: activation-sum scratch stays on the stack */
+
+/* Threading floor, shared by both packed matvecs. The API wins over the environment: a
+ * consumer that knows its own shapes should not have to export a variable to be fast. */
+static long g_qmv_thread_min = -1;
+void nt_qmv_set_thread_min(long elems) { g_qmv_thread_min = (elems > 0) ? elems : (4L << 20); }
+static long nt_qmv_thread_floor(void) {
+    if (g_qmv_thread_min < 0) {
+        const char *e = getenv("NT_QMV_THREAD_MIN");
+        g_qmv_thread_min = (e && atol(e) > 0) ? atol(e) : (4L << 20);
+    }
+    return g_qmv_thread_min;
+}
 
 typedef struct {
     nt_qrows_fn fn; float *out; const uint8_t *Wq; const float *x;
@@ -5275,12 +5288,7 @@ int nt_qmatvec(float *out, const uint8_t *Wq, int dtype,
      * it, so its whole decode stays single-threaded. Default is unchanged;
      * NT_QMV_THREAD_MIN lets a consumer set the floor for its own shape after
      * measuring (the eye engine runs at 256K: 3.7 -> 7.3 tok/s, same output). */
-    static long thread_floor = -1;
-    if (thread_floor < 0) {
-        const char *e = getenv("NT_QMV_THREAD_MIN");
-        thread_floor = (e && atol(e) > 0) ? atol(e) : (4L << 20);
-    }
-    if (nt <= 1 || (long)m * k < thread_floor) { fn(out, Wq, x, 0, m, k); return 0; }
+    if (nt <= 1 || (long)m * k < nt_qmv_thread_floor()) { fn(out, Wq, x, 0, m, k); return 0; }
 
 #ifdef _OPENMP
     /* When the consumer is an OpenMP program, private pthreads are actively harmful, not
@@ -5467,9 +5475,18 @@ static void nt_q6_k_rows_i8(float *out, const uint8_t *W, const int8_t *qa,
             float d = nt_f16_to_f32((uint16_t)(b[208] | (b[209] << 8)));
             const int8_t *qab = qa + (long)blk * 256;
             const float  *dab = da + (long)blk * 8;
+            /* Same lane treatment the Q4_K path got. This kernel drained TWICE per group —
+             * four dependent hadds and two extracts, sixteen drains per 256-value block —
+             * because each group carries two 16-value sub-blocks, one per 128-bit half.
+             * That is exactly what a hadd tree resolves for free: hadd works within halves,
+             * so folding four groups yields the four lower sub-block sums in lanes 0-3 and
+             * the four upper ones in lanes 4-7 of a single vector. Two trees cover a block.
+             * Accumulation order is preserved group by group, lower sub-block then upper,
+             * so this is an integer re-order and the greedy vector must not move. */
             for (int n = 0; n < 256; n += 128) {
                 const uint8_t *qlh = ql + (n / 128) * 64, *qhh = qh + (n / 128) * 32;
                 __m256i qhv = _mm256_loadu_si256((const __m256i *)qhh);
+                __m256i s[4];
                 for (int g = 0; g < 4; g++) {
                     __m256i qlv = _mm256_loadu_si256((const __m256i *)(qlh + (g & 1) * 32));
                     __m256i lo  = (g < 2) ? _mm256_and_si256(qlv, m4)
@@ -5477,17 +5494,19 @@ static void nt_q6_k_rows_i8(float *out, const uint8_t *W, const int8_t *qa,
                     __m256i hi2 = _mm256_and_si256(_mm256_srli_epi16(qhv, 2 * g), m3);
                     __m256i w   = _mm256_sub_epi8(_mm256_or_si256(lo, _mm256_slli_epi16(hi2, 4)), b32);
                     __m256i xv  = _mm256_loadu_si256((const __m256i *)(qab + n + g * 32));
-                    __m256i p   = _mm256_maddubs_epi16(_mm256_sign_epi8(w, w),
-                                                       _mm256_sign_epi8(xv, w));
-                    __m256i s32 = _mm256_madd_epi16(p, ones);
-                    __m128i l0 = _mm256_castsi256_si128(s32);          /* positions  0..15 */
-                    __m128i l1 = _mm256_extracti128_si256(s32, 1);     /* positions 16..31 */
-                    l0 = _mm_hadd_epi32(l0, l0); l0 = _mm_hadd_epi32(l0, l0);
-                    l1 = _mm_hadd_epi32(l1, l1); l1 = _mm_hadd_epi32(l1, l1);
+                    s[g] = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_sign_epi8(w, w),
+                                                                  _mm256_sign_epi8(xv, w)), ones);
+                }
+                /* lanes 0-3: lower sub-block of groups 0..3; lanes 4-7: their upper one */
+                __m256i T = _mm256_hadd_epi32(_mm256_hadd_epi32(s[0], s[1]),
+                                              _mm256_hadd_epi32(s[2], s[3]));
+                int32_t t[8];
+                _mm256_storeu_si256((__m256i *)t, T);
+                for (int g = 0; g < 4; g++) {
                     int j0 = n / 16 + g * 2;
                     acc += d * dab[(n + g * 32) / 32]
-                         * ((float)sc[j0]     * (float)_mm_cvtsi128_si32(l0)
-                          + (float)sc[j0 + 1] * (float)_mm_cvtsi128_si32(l1));
+                         * ((float)sc[j0]     * (float)t[g]
+                          + (float)sc[j0 + 1] * (float)t[g + 4]);
                 }
             }
         }
@@ -5552,30 +5571,178 @@ static void *nt_qworker_i8(void *p) {
 }
 #endif
 
+// Q4_K int8-dot rows: 144 B / 256 values against the per-32 int8 activation.
+// The two grids COINCIDE here — a Q4_K sub-block is 32 values and so is an activation
+// block — which makes the split exact and the bookkeeping simpler than Q6_K's 16/32 seam.
+// Per sub-block s the affine format gives w = d*ls*q - dmin*lm, so
+//     sum_p w*x  =  da[s] * ( d*ls * SUM(q*qa)  -  dmin*lm * SUM(qa) )
+// The minus term depends only on the activation, so SUM(qa) is precomputed once per call
+// and lifted straight out of the integer dot — no per-weight subtraction anywhere.
+// q is already unsigned [0,15], so _mm256_maddubs_epi16 applies directly with no sign
+// trick, and 15*127*2 = 3810 clears int16 with room to spare.
+#if defined(__AVX2__) && defined(__FMA__)
+static void nt_q4_k_rows_i8(float *out, const uint8_t *W, const int8_t *qa,
+                            const float *da, int r0, int r1, int k) {
+    int nb = k / 256, nsub = k / 32;
+    int32_t asum[NT_QMV_ASUM_MAX];
+    const __m256i m4 = _mm256_set1_epi8(0x0F), ones = _mm256_set1_epi16(1);
+    /* SUM(qa) per 32-value block. Scalar it is 32 dependent adds per block and it is paid on
+     * every call — in a fused MoE that is 24 calls per layer per thread. maddubs against a
+     * vector of ones turns the same sum into a handful of instructions: unsigned 1 times a
+     * signed activation is exactly the activation, so the pairwise adds come for free. */
+    { const __m256i one8 = _mm256_set1_epi8(1);
+      for (int s = 0; s < nsub; s++) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(qa + (long)s * 32));
+        __m256i w = _mm256_madd_epi16(_mm256_maddubs_epi16(one8, v), ones);
+        __m128i lo = _mm_add_epi32(_mm256_castsi256_si128(w), _mm256_extracti128_si256(w, 1));
+        lo = _mm_hadd_epi32(lo, lo); lo = _mm_hadd_epi32(lo, lo);
+        asum[s] = _mm_cvtsi128_si32(lo);
+      } }
+    for (int row = r0; row < r1; row++) {
+        const uint8_t *rb = W + (long)row * nb * 144;
+        float acc = 0.0f;
+        for (int blk = 0; blk < nb; blk++) {
+            const uint8_t *b = rb + (long)blk * 144;
+            float d    = nt_f16_to_f32((uint16_t)(b[0] | (b[1] << 8)));
+            float dmin = nt_f16_to_f32((uint16_t)(b[2] | (b[3] << 8)));
+            const uint8_t *sc = b + 4, *qs = b + 16;
+            /* Four sub-blocks per pass. A per-sub-block horizontal reduction costs two
+             * dependent hadds plus an extract, and at 32 values per sub-block that drain
+             * dominates on the small matrices this body is made of (an expert is 768x2048;
+             * measured 41% of stream bandwidth against 59% for the 151936-row head, where
+             * the same drain amortises). One hadd cascade retires four sub-blocks instead
+             * of one, so the drain is paid 3 times per 4 instead of 8.
+             * The float accumulation ORDER is deliberately unchanged — contributions are
+             * still added sub-block by sub-block ascending — so this stays a pure integer
+             * re-order and the consumer's greedy vector must not move. */
+            /* Whole block in one pass. Two things the four-at-a-time form still paid for:
+             * qs was loaded EIGHT times though sub-blocks 2p and 2p+1 share one 32-byte load
+             * (low nibbles feed the even sub-block, high nibbles the odd one), and the 6-bit
+             * (scale,min) unpack sat inside the hot loop. Now: four loads, one unpack pass,
+             * and the eight sub-block dots land in the lanes of a single vector through one
+             * hadd tree instead of a drain per sub-block.
+             * The float accumulation order is unchanged — still ascending by sub-block — so
+             * this remains an integer re-order and the consumer's greedy vector must not move. */
+            uint8_t ls[8], lm[8];
+            for (int j = 0; j < 8; j++) nt_get_scale_min_k4(j, sc, &ls[j], &lm[j]);
+            __m256i s[8];
+            for (int p = 0; p < 4; p++) {
+                __m256i qsv = _mm256_loadu_si256((const __m256i *)(qs + p * 32));
+                __m256i lo  = _mm256_and_si256(qsv, m4);
+                __m256i hi  = _mm256_and_si256(_mm256_srli_epi16(qsv, 4), m4);
+                __m256i a0  = _mm256_loadu_si256((const __m256i *)(qa + (long)(blk * 8 + 2*p) * 32));
+                __m256i a1  = _mm256_loadu_si256((const __m256i *)(qa + (long)(blk * 8 + 2*p + 1) * 32));
+                s[2*p]     = _mm256_madd_epi16(_mm256_maddubs_epi16(lo, a0), ones);
+                s[2*p + 1] = _mm256_madd_epi16(_mm256_maddubs_epi16(hi, a1), ones);
+            }
+            __m256i A = _mm256_hadd_epi32(_mm256_hadd_epi32(s[0], s[1]),
+                                          _mm256_hadd_epi32(s[2], s[3]));
+            __m256i B = _mm256_hadd_epi32(_mm256_hadd_epi32(s[4], s[5]),
+                                          _mm256_hadd_epi32(s[6], s[7]));
+            __m256i sums = _mm256_add_epi32(_mm256_permute2x128_si256(A, B, 0x20),
+                                            _mm256_permute2x128_si256(A, B, 0x31));
+            /* The scalar tail stays scalar on purpose. GCC contracts
+             * d * scale * dot - dmin * min * asum into an FMA under -march=native, and that
+             * single rounding is part of every number this kernel has ever been accepted on.
+             * Intrinsics cannot express the compiler's contraction choice: a hand-vectorised
+             * tail was measured against this one and differed on 521 of 768 rows, worst 4.8e-4
+             * relative, which moved the perplexity of an untouched container in the fourth
+             * decimal while every argmax and every six-digit probe stayed put. The dots are
+             * vectorised because they are integers and exact; the float tail is not. */
+            int32_t dots[8];
+            _mm256_storeu_si256((__m256i *)dots, sums);
+            for (int j = 0; j < 8; j++) {
+                int sub = blk * 8 + j;
+                acc += da[sub] * (d * (float)ls[j] * (float)dots[j]
+                                - dmin * (float)lm[j] * (float)asum[sub]);
+            }
+        }
+        out[row] = acc;
+    }
+}
+#else
+static void nt_q4_k_rows_i8(float *out, const uint8_t *W, const int8_t *qa,
+                            const float *da, int r0, int r1, int k) {
+    int nb = k / 256, nsub = k / 32;
+    int32_t asum[NT_QMV_ASUM_MAX];
+    for (int s = 0; s < nsub; s++) {
+        const int8_t *p = qa + (long)s * 32;
+        int32_t t = 0;
+        for (int i = 0; i < 32; i++) t += p[i];
+        asum[s] = t;
+    }
+    for (int row = r0; row < r1; row++) {
+        const uint8_t *rb = W + (long)row * nb * 144;
+        float acc = 0.0f;
+        for (int blk = 0; blk < nb; blk++) {
+            const uint8_t *b = rb + (long)blk * 144;
+            float d    = nt_f16_to_f32((uint16_t)(b[0] | (b[1] << 8)));
+            float dmin = nt_f16_to_f32((uint16_t)(b[2] | (b[3] << 8)));
+            const uint8_t *sc = b + 4, *qs = b + 16;
+            for (int j = 0; j < 8; j++) {
+                uint8_t s6, m6; nt_get_scale_min_k4(j, sc, &s6, &m6);
+                int sub = blk * 8 + j;
+                const uint8_t *qsp = qs + (j >> 1) * 32;
+                const int8_t  *qab = qa + (long)sub * 32;
+                int32_t dot = 0;
+                if (j & 1) for (int l = 0; l < 32; l++) dot += (int32_t)(qsp[l] >> 4)   * qab[l];
+                else       for (int l = 0; l < 32; l++) dot += (int32_t)(qsp[l] & 0x0F) * qab[l];
+                acc += da[sub] * (d * (float)s6 * (float)dot
+                                - dmin * (float)m6 * (float)asum[sub]);
+            }
+        }
+        out[row] = acc;
+    }
+}
+#endif
+
+/* Pick the i8 row kernel for a dtype, or NULL. Shared by the fan-out entry and the
+ * caller-parallel one so the two can never drift apart. */
+static nt_qrows_i8_fn nt_qrows_i8_for(int dtype, int k) {
+    if (k % 32) return NULL;
+    switch (dtype) {
+    case 2:  return nt_q4_0_rows_i8;
+    case 8:  return nt_q8_0_rows_i8;
+    case 12: return (k % 256) ? NULL : nt_q4_k_rows_i8;
+    case 14: return (k % 256) ? NULL : nt_q6_k_rows_i8;
+    default: return NULL;
+    }
+}
+
+void nt_quant_act(const float *x, int k, int8_t *qa, float *da) {
+    nt_quant_act_q8(x, k, qa, da);
+}
+
+int nt_qmatvec_i8_rows(float *out, const uint8_t *Wq, int dtype,
+                       const int8_t *qa, const float *da, int r0, int r1, int k) {
+    nt_qrows_i8_fn fn = nt_qrows_i8_for(dtype, k);
+    if (!fn) return -1;
+    if (k / 32 > NT_QMV_ASUM_MAX) return -1;
+    if (r1 > r0) fn(out, Wq, qa, da, r0, r1, k);
+    return 0;
+}
+
 int nt_qmatvec_i8(float *out, const uint8_t *Wq, int dtype,
                   const float *x, int m, int k) {
-    if (dtype != 2 && dtype != 8 && dtype != 14) return -1;  /* Q4_0, Q8_0, Q6_K */
+    if (dtype != 2 && dtype != 8 && dtype != 12 && dtype != 14) return -1;  /* Q4_0/Q8_0/Q4_K/Q6_K */
     if (k % 32) return -1;
-    if (dtype == 14 && (k % 256)) return -1;
+    if ((dtype == 12 || dtype == 14) && (k % 256)) return -1;
+    if (k / 32 > NT_QMV_ASUM_MAX) return -1;      /* per-call activation sums are stack-held */
     int nb = k / 32;
     int8_t *qa = (int8_t *)malloc((size_t)k);
     float  *da = (float *)malloc((size_t)nb * sizeof(float));
     if (!qa || !da) { free(qa); free(da); return -1; }
     nt_quant_act_q8(x, k, qa, da);
 
-    nt_qrows_i8_fn fn = (dtype == 2) ? nt_q4_0_rows_i8
-                      : (dtype == 8) ? nt_q8_0_rows_i8
-                                     : nt_q6_k_rows_i8;
+    nt_qrows_i8_fn fn = (dtype == 2)  ? nt_q4_0_rows_i8
+                      : (dtype == 8)  ? nt_q8_0_rows_i8
+                      : (dtype == 12) ? nt_q4_k_rows_i8
+                                      : nt_q6_k_rows_i8;
     int nt = (int)sysconf(_SC_NPROCESSORS_ONLN);
     if (nt < 1) nt = 1;
     if (nt > NT_QMV_MAX_THREADS) nt = NT_QMV_MAX_THREADS;
     if (nt > m) nt = m;
-    static long thread_floor_i8 = -1;
-    if (thread_floor_i8 < 0) {
-        const char *e = getenv("NT_QMV_THREAD_MIN");
-        thread_floor_i8 = (e && atol(e) > 0) ? atol(e) : (4L << 20);
-    }
-    if (nt <= 1 || (long)m * k < thread_floor_i8) {
+    if (nt <= 1 || (long)m * k < nt_qmv_thread_floor()) {
         fn(out, Wq, qa, da, 0, m, k);
         free(qa); free(da);
         return 0;
