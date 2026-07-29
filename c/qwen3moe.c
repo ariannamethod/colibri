@@ -49,8 +49,12 @@
 #include "st.h"
 #include "notorch.h"      /* vendored: nt_qmatvec packed Q6_K */
 #include "qwen_tok.h"     /* Qwen byte-level BPE, schema read from tokenizer.json */
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 #define GGUF_Q6_K 14      /* GGUF type code; the container states it in config.json */
+#define GGUF_Q4_K 12      /* T5f: experts as affine Q4_K, 144 B / 256 values */
 
 #ifdef ACC_DOUBLE
 typedef double acc_t;
@@ -62,6 +66,8 @@ typedef float acc_t;
 typedef struct {
     int hidden, n_layers, n_heads, n_kv_heads, head_dim, n_experts, topk, moe_inter, vocab, norm_topk;
     int lm_head_dtype;   /* 0 = infer from the container; 14 = Q6_K blob */
+    int expert_dtype;    /* 0 = infer (int4 via .qs); 12 = Q4_K blob (T5f) */
+    int attn_dtype;      /* 0 = infer (int4 via .qs); 12 = Q4_K blob (T5f move 2) */
     float eps; double theta;
 } Cfg;
 
@@ -86,6 +92,8 @@ static void load_cfg(Cfg *c, const char *dir){
     if(c->theta==0.0){ jval *rp=json_get(r,"rope_parameters"); c->theta=jget(rp,"rope_theta",10000.0); }
     jval *nt=json_get(r,"norm_topk_prob"); c->norm_topk=(nt&&nt->t==J_BOOL)?nt->boolean:1;
     c->lm_head_dtype=(int)jget(r,"lm_head_dtype",0);
+    c->expert_dtype=(int)jget(r,"expert_dtype",0);
+    c->attn_dtype=(int)jget(r,"attn_dtype",0);
     free(ar); free(buf);
 }
 
@@ -268,6 +276,17 @@ static int g_idot=1, g_i4s=2, g_expert_idot=1;   /* expert idot default ON: meas
 typedef struct { int kind; float *f; uint8_t *q; float *s; } QW;   /* kind: 0=f32, 4=int4, 8=int8 */
 static void qmatmul_ex(float *y, const float *x, const QW *w, int S, int I, int O, int allow_idot){
     if(w->kind==0){ matmul(y,x,w->f,S,I,O); return; }
+    if(w->kind==GGUF_Q4_K){
+        for(int s=0;s<S;s++){
+            const float *xs=x+(int64_t)s*I; float *ys=y+(int64_t)s*O;
+            int rc = (allow_idot && g_attn_idot)
+                   ? nt_qmatvec_i8(ys, w->q, GGUF_Q4_K, xs, O, I)   /* int8 act, approximate */
+                   : nt_qmatvec   (ys, w->q, GGUF_Q4_K, xs, O, I);  /* f32 act, exact */
+            if(rc!=0){ fprintf(stderr,"nt_qmatvec%s: no Q4_K kernel for k=%d\n",
+                               g_attn_idot?"_i8":"",I); exit(1); }
+        }
+        return;
+    }
     if(w->kind==GGUF_Q6_K){
         for(int s=0;s<S;s++){
             const float *xs=x+(int64_t)s*I; float *ys=y+(int64_t)s*O;
@@ -323,6 +342,8 @@ typedef struct {
     Cfg c;
     shards S;
     int e_int4;               /* 1: experts int4 packed (+.qs); 0: experts f32/bf16 full precision */
+    int e_q4k;                /* 1: experts are block-quant blobs (config expert_dtype=12) */
+    int *e_down_q6;           /* per layer: down_proj is Q6_K (mix) rather than Q4_K */
     float *embed, *final_ln; QW lm_head;
     Layer *L;
     LCache *cache;
@@ -365,6 +386,37 @@ static void load_qw(Model *m, QW *w, const char *name, int O, int I){
     }
 }
 
+/* Q4_K resident weight (T5f move 2, attention): same contract as the Q6_K head — an opaque
+ * U8 blob, no .qs sibling, flagged by config, and the only structural invariant is the byte
+ * count O*(I/256)*144. Everything off-contract is fatal here rather than decoded as noise. */
+/* T5f move 3: the container is a MIX — v_proj and expert down_proj are Q6_K on the layers the
+ * oracle uses and Q4_K elsewhere. No layer list is needed anywhere: the two formats pack the
+ * same 256 values into 144 vs 210 bytes, so the byte count IDENTIFIES the type. Anything that
+ * is neither is fatal, so a truncated shard still cannot pass as the other format. */
+static int blockq_kind_of(int64_t nb, int O, int I){
+    if(I%256) return -1;
+    int64_t nblk=(int64_t)O*(I/256);
+    if(nb==nblk*144) return GGUF_Q4_K;
+    if(nb==nblk*210) return GGUF_Q6_K;
+    return -1;
+}
+static void load_q4k_w(Model *m, QW *w, const char *name, int O, int I){
+    memset(w,0,sizeof(*w));
+    char qs[300]; snprintf(qs,sizeof qs,"%s.qs",name);
+    st_tensor *t=st_find(&m->S,name);
+    if(!t){ fprintf(stderr,"%s: missing, but config says attn_dtype=%d\n",name,GGUF_Q4_K); exit(1); }
+    if(t->dtype!=3){ fprintf(stderr,"%s: dtype %d — a block-quant weight must be stored U8\n",name,t->dtype); exit(1); }
+    if(st_numel(&m->S,qs)>0){ fprintf(stderr,"%s: unexpected .qs sibling on a block-quant weight\n",name); exit(1); }
+    int64_t nb=st_nbytes(&m->S,name);
+    int k=blockq_kind_of(nb,O,I);
+    if(k<0){ fprintf(stderr,"%s: %lld B is neither Q4_K (%lld) nor Q6_K (%lld) for O=%d I=%d\n",
+                     name,(long long)nb,(long long)((int64_t)O*(I/256)*144),
+                     (long long)((int64_t)O*(I/256)*210),O,I); exit(1); }
+    w->kind=k; w->q=malloc(nb);
+    if(!w->q){ fprintf(stderr,"%s: OOM %lld B\n",name,(long long)nb); exit(1); }
+    st_read_raw(&m->S,name,w->q,0);
+}
+
 /* Q6_K head: an opaque U8 blob with NO .qs sibling — the super-scale (f16) and the 16 int8
  * sub-scales live inside each 210-byte block. Byte count cannot signal Q6_K (the container's
  * int8/int4 inference keys off O*I / O*((I+1)/2)), so config.json states "lm_head_dtype": 14
@@ -397,12 +449,40 @@ static void model_init(Model *m, const char *snap, int cap){
       snprintf(n0,sizeof n0,"model.layers.0.mlp.experts.0.gate_proj.weight");
       snprintf(qs,sizeof qs,"%s.qs",n0);
       st_tensor *t=st_find(&m->S,n0);
-      m->e_int4 = (t && t->dtype==3 && st_numel(&m->S,qs)>0);
-      if(m->e_int4){                              /* confirm byte-count is int4, not int8 */
-        int64_t nb=st_nbytes(&m->S,n0), O=c->moe_inter, I=c->hidden;
-        if(nb!=O*((I+1)/2)){ fprintf(stderr,"expert bytes %ld != int4 %ld (int8? unsupported)\n",(long)nb,(long)(O*((I+1)/2))); exit(1); }
+      int64_t O=c->moe_inter, I=c->hidden;
+      if(c->expert_dtype==GGUF_Q4_K){
+          /* Q4_K experts: an opaque U8 blob, scales and mins live inside each 144-byte
+           * block, so there is no .qs sibling and byte count is the only structural
+           * invariant. Stated by config, cross-checked here, fatal on mismatch. */
+          if(!t || t->dtype!=3){ fprintf(stderr,"experts: config says Q4_K but tensor is dtype %d (need U8)\n", t?t->dtype:-1); exit(1); }
+          if(I%256){ fprintf(stderr,"experts: I=%lld not a multiple of 256 — Q4_K impossible\n",(long long)I); exit(1); }
+          if(st_numel(&m->S,qs)>0){ fprintf(stderr,"experts: unexpected .qs sibling on a Q4_K expert\n"); exit(1); }
+          int64_t nb=st_nbytes(&m->S,n0), want=O*(I/256)*144;
+          if(nb!=want){ fprintf(stderr,"expert Q4_K bytes %lld != O*(I/256)*144 = %lld (truncated or wrong dims)\n",(long long)nb,(long long)want); exit(1); }
+          m->e_int4=0; m->e_q4k=1;
+          /* Which layers carry a Q6_K down_proj is read off the bytes, layer by layer. */
+          m->e_down_q6=calloc(c->n_layers,sizeof(int));
+          for(int l=0;l<c->n_layers;l++){
+              char dn[256]; snprintf(dn,sizeof dn,"model.layers.%d.mlp.experts.0.down_proj.weight",l);
+              int64_t dnb=st_nbytes(&m->S,dn);
+              int dk=blockq_kind_of(dnb,c->hidden,c->moe_inter);
+              if(dk<0){ fprintf(stderr,"%s: %lld B is neither Q4_K nor Q6_K\n",dn,(long long)dnb); exit(1); }
+              m->e_down_q6[l] = (dk==GGUF_Q6_K);
+          }
+      } else {
+          m->e_int4 = (t && t->dtype==3 && st_numel(&m->S,qs)>0);
+          if(m->e_int4){                          /* confirm byte-count is int4, not int8 */
+            int64_t nb=st_nbytes(&m->S,n0);
+            if(nb!=O*((I+1)/2)){ fprintf(stderr,"expert bytes %ld != int4 %ld (int8? unsupported)\n",(long)nb,(long)(O*((I+1)/2))); exit(1); }
+          }
       }
     }
+    /* Tell notorch our shapes instead of exporting a variable. Its 4M default was measured
+     * on a 360M decoder; a 30B expert matvec is moe_inter*hidden = 1.57M and would sit under
+     * it, running single-threaded (measured 0.44 -> 2.25 tok/s once lowered). 128K keeps the
+     * genuinely small matvecs serial while every expert, projection and head fans out. */
+    nt_qmv_set_thread_min(1 << 17);
+
     int half=c->head_dim/2; m->inv=malloc(half*sizeof(double));
     for(int i=0;i<half;i++) m->inv[i]=1.0/pow(c->theta,(double)(2*i)/c->head_dim);
 
@@ -419,11 +499,15 @@ static void model_init(Model *m, const char *snap, int cap){
         LN(in_ln,"input_layernorm.weight"); LN(post_ln,"post_attention_layernorm.weight");
         LN(qn,"self_attn.q_norm.weight"); LN(kn,"self_attn.k_norm.weight");
         #undef LN
-        #define LQ(field,suffix,OO,II) snprintf(nm,sizeof nm,"model.layers.%d." suffix,l); load_qw(m,&L->field,nm,OO,II)
+        #define LQ(field,suffix,OO,II) snprintf(nm,sizeof nm,"model.layers.%d." suffix,l); \
+            if(c->attn_dtype==GGUF_Q4_K) load_q4k_w(m,&L->field,nm,OO,II); else load_qw(m,&L->field,nm,OO,II)
         LQ(q,"self_attn.q_proj.weight", H*hd, D); LQ(k,"self_attn.k_proj.weight", KV*hd, D);
         LQ(v,"self_attn.v_proj.weight", KV*hd, D); LQ(o,"self_attn.o_proj.weight", D, H*hd);
-        LQ(gate,"mlp.gate.weight", c->n_experts, D);
         #undef LQ
+        /* Router stays full precision by contract (the loader requires it), so it never goes
+         * through the Q4_K branch above — it is loaded on its own, not via LQ. */
+        snprintf(nm,sizeof nm,"model.layers.%d.mlp.gate.weight",l);
+        load_qw(m,&L->gate,nm,c->n_experts,D);
     }
     m->cache=calloc(c->n_layers,sizeof(LCache));
     for(int l=0;l<c->n_layers;l++){ m->cache[l].cap=cap; m->cache[l].slots=calloc(cap,sizeof(Slot)); }
@@ -437,7 +521,10 @@ static void load_expert(Model *m, int layer, int eid, Slot *s){
     for(int t=0;t<3;t++){
         snprintf(nm,sizeof nm,"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[t]);
         int O=(t<2)?c->moe_inter:c->hidden, I=(t<2)?c->hidden:c->moe_inter;
-        if(m->e_int4){
+        if(m->e_q4k){
+            uint8_t *q=(t==0)?s->qg:(t==1)?s->qu:s->qd;
+            st_read_raw(&m->S,nm,q,g_expert_drop);   /* Q4_K blob, scales inside the blocks */
+        } else if(m->e_int4){
             uint8_t *q=(t==0)?s->qg:(t==1)?s->qu:s->qd;
             float   *sc=(t==0)?s->sg:(t==1)?s->su:s->sd;
             snprintf(qs,sizeof qs,"%s.qs",nm);
@@ -457,11 +544,18 @@ static Slot *expert_get(Model *m, int layer, int eid){
     m->miss++;
     Cfg *c=&m->c;
     int64_t Ig=(int64_t)c->moe_inter*c->hidden, Id=(int64_t)c->hidden*c->moe_inter;   /* elements */
-    int64_t rbg=(int64_t)c->moe_inter*((c->hidden+1)/2), rbd=(int64_t)c->hidden*((c->moe_inter+1)/2); /* int4 bytes */
+    int64_t rbg, rbd;
+    if(m->e_q4k){ rbg=(int64_t)c->moe_inter*(c->hidden/256)*144;      /* gate/up always Q4_K */
+                  rbd=(int64_t)c->hidden*(c->moe_inter/256)*(m->e_down_q6[layer]?210:144); }
+    else        { rbg=(int64_t)c->moe_inter*((c->hidden+1)/2);        /* int4 bytes */
+                  rbd=(int64_t)c->hidden*((c->moe_inter+1)/2); }
     Slot *s;
     if(lc->n<lc->cap){
         s=&lc->slots[lc->n++];
-        if(m->e_int4){
+        if(m->e_q4k){
+            s->qg=aligned_alloc(64,rbg); s->qu=aligned_alloc(64,rbg); s->qd=aligned_alloc(64,rbd);
+            if(!s->qg||!s->qu||!s->qd){ fprintf(stderr,"expert slot alloc failed\n"); exit(1); }
+        } else if(m->e_int4){
             /* T5d move 6b. Expert rows are 1024 B (gate/up) and 384 B (down) — both exact
              * multiples of the 64 B cache line, so a 64-B-aligned base makes EVERY row
              * line-aligned. Plain malloc gives 16 B: three quarters of the slots start
@@ -553,6 +647,77 @@ static void experts_fused(Model *m, Slot **sl, int topk, const int8_t *xq, float
         p_e_gu+=_t1-_t0; p_e_act+=_t2-_t1; p_e_dn+=_t3-_t2; p_e_red+=_t4-_t3; }
 }
 
+/* T5f — Q4_K experts through the notorch packed kernel (dtype 12, f32 activation, exact).
+ * nt_qmatvec threads internally on the caller's OpenMP team since T5e, so each call is
+ * already parallel and the fused (expert x row) flattening of move 3 does not apply here:
+ * the affine block format has no int8-activation kernel yet (nt_qmatvec_i8 covers 2/8/14),
+ * so the head-side trick is unavailable until that lands upstream. Reduction keeps kk order,
+ * matching every other expert path. */
+/* T5f move 5 — the fused pass of T5d move 3, carried over to the block-quant formats.
+ * The unfused version called nt_qmatvec_i8 once per matrix: 3 matmuls x topk 8 x 48 layers
+ * = 1152 fan-outs per token, and it re-quantized the SAME activation row inside 16 of them
+ * per layer. Here the row is quantized once, the engine opens ONE region per phase, and each
+ * thread takes a row slice of every matrix through nt_qmatvec_i8_rows — so the fan-out cost
+ * is 4 regions per layer instead of 24 and load balance is exact by construction.
+ * Rows are disjoint and the reduction keeps kk order, so this is an integer re-order:
+ * bit-identical to the unfused path, which the tiny pair and the 16-id vector must show. */
+static void experts_q4k(Model *m, Slot **sl, int topk, const float *x,
+                        const float *wsel, float *moe, float *gga, float *uua, float *dna,
+                        int down_dtype, int8_t *xq, float *dxq, int8_t *gqa, float *dgq){
+    Cfg *c=&m->c; int D=c->hidden, I=c->moe_inter;
+    int i8 = g_idot && g_expert_idot;
+    if(!i8){                                   /* exact path kept for side-by-side checks */
+        for(int kk=0;kk<topk;kk++){
+            Slot *s=sl[kk];
+            float *g=gga+(int64_t)kk*I, *u=uua+(int64_t)kk*I, *dn=dna+(int64_t)kk*D;
+            if(nt_qmatvec(g,s->qg,GGUF_Q4_K,x,I,D) || nt_qmatvec(u,s->qu,GGUF_Q4_K,x,I,D)){
+                fprintf(stderr,"nt_qmatvec: Q4_K exact gate/up failed\n"); exit(1); }
+            for(int i=0;i<I;i++) g[i]=siluf(g[i])*u[i];
+            if(nt_qmatvec(dn,s->qd,down_dtype,g,D,I)){
+                fprintf(stderr,"nt_qmatvec: exact down failed (dtype %d)\n",down_dtype); exit(1); }
+            for(int i=0;i<D;i++) moe[i]+=wsel[kk]*dn[i];
+        }
+        return;
+    }
+    double _t0 = g_profile ? now_s() : 0.0;
+    nt_quant_act(x, D, xq, dxq);               /* once for every expert in the layer */
+    #pragma omp parallel
+    {
+        int nth=1, id=0;
+#ifdef _OPENMP
+        nth=omp_get_num_threads(); id=omp_get_thread_num();
+#endif
+        int r0=(int)((long)I*id/nth), r1=(int)((long)I*(id+1)/nth);
+        for(int t=0;t<2*topk;t++){
+            int kk=t>>1, up=t&1;
+            nt_qmatvec_i8_rows((up?uua:gga)+(int64_t)kk*I,
+                               up?sl[kk]->qu:sl[kk]->qg, GGUF_Q4_K, xq, dxq, r0, r1, D);
+        }
+    }
+    double _t1 = g_profile ? now_s() : 0.0;
+    #pragma omp parallel for schedule(static)
+    for(int t=0;t<topk*I;t++) gga[t]=siluf(gga[t])*uua[t];
+    for(int kk=0;kk<topk;kk++)
+        nt_quant_act(gga+(int64_t)kk*I, I, gqa+(int64_t)kk*I, dgq+(int64_t)kk*(I/32));
+    double _t2 = g_profile ? now_s() : 0.0;
+    #pragma omp parallel
+    {
+        int nth=1, id=0;
+#ifdef _OPENMP
+        nth=omp_get_num_threads(); id=omp_get_thread_num();
+#endif
+        int r0=(int)((long)D*id/nth), r1=(int)((long)D*(id+1)/nth);
+        for(int kk=0;kk<topk;kk++)
+            nt_qmatvec_i8_rows(dna+(int64_t)kk*D, sl[kk]->qd, down_dtype,
+                               gqa+(int64_t)kk*I, dgq+(int64_t)kk*(I/32), r0, r1, I);
+    }
+    if(g_profile){ double _t3=now_s(); p_e_gu+=_t1-_t0; p_e_act+=_t2-_t1; p_e_dn+=_t3-_t2; }
+    for(int kk=0;kk<topk;kk++){
+        const float *d=dna+(int64_t)kk*D; float wg=wsel[kk];
+        for(int i=0;i<D;i++) moe[i]+=wg*d[i];
+    }
+}
+
 /* T5d move 4 — QK score dot. It was a scalar double chain (a += (double)q[i]*k[i], hd=128):
  * the loop-carried dependency blocks vectorization outright, and the profile charged 8.63
  * ms/tok to scores. Accumulating in DOUBLE lanes (not float) is the deliberate choice: the
@@ -605,7 +770,28 @@ static void attention(Model *m, Layer *l, int layer, const float *x, int S, int 
     float *q=falloc((int64_t)S*H*hd), *k=falloc((int64_t)S*KV*hd), *v=falloc((int64_t)S*KV*hd);
     int ai = g_attn_idot ? 2 : 0;
     { PT_T0;
-    if(ai && g_idot && S==1 && l->q.kind==4 && l->k.kind==4 && l->v.kind==4){
+    /* q/k/v share one input row. Going through nt_qmatvec_i8 per projection pays a fan-out
+     * each time — measured at ~32 us for a 4096-row matrix, i.e. 3 x 48 x 32 us = 4.6 ms per
+     * token — plus two mallocs and a re-quantization of the identical row. One region, three
+     * row ranges, one quantization. Integer re-order: the greedy vector must not move. */
+    if(ai && g_idot && S==1 && l->q.kind==GGUF_Q4_K && l->k.kind==GGUF_Q4_K && l->v.kind==GGUF_Q4_K){
+        int8_t *xq1=malloc(D); float *dx1=malloc((size_t)(D/32+1)*sizeof(float));
+        nt_quant_act(x, D, xq1, dx1);
+        #pragma omp parallel
+        {
+            int nth=1, id=0;
+#ifdef _OPENMP
+            nth=omp_get_num_threads(); id=omp_get_thread_num();
+#endif
+            int hq=H*hd, hk=KV*hd;
+            int q0=(int)((long)hq*id/nth), q1=(int)((long)hq*(id+1)/nth);
+            int k0=(int)((long)hk*id/nth), k1=(int)((long)hk*(id+1)/nth);
+            nt_qmatvec_i8_rows(q, l->q.q, GGUF_Q4_K, xq1, dx1, q0, q1, D);
+            nt_qmatvec_i8_rows(k, l->k.q, GGUF_Q4_K, xq1, dx1, k0, k1, D);
+            nt_qmatvec_i8_rows(v, l->v.q, GGUF_Q4_K, xq1, dx1, k0, k1, D);
+        }
+        free(xq1); free(dx1);
+    } else if(ai && g_idot && S==1 && l->q.kind==4 && l->k.kind==4 && l->v.kind==4){
         int8_t *xq1=malloc(D); float sx1=qrow_i8(x, xq1, D);   /* quantized ONCE for all three */
         attn_qkv_fused(&l->q,&l->k,&l->v,xq1,sx1,q,k,v,D,H*hd,KV*hd);
         free(xq1);
@@ -660,11 +846,15 @@ static void step(Model *m, const int *ids, int S, int pos_base, float *logits, i
     float *gga=falloc((int64_t)c->topk*c->moe_inter), *uua=falloc((int64_t)c->topk*c->moe_inter);
     float *dna=falloc((int64_t)c->topk*D), *sga=falloc(c->topk);
     int8_t *gqa=malloc((size_t)c->topk*c->moe_inter);
+    float *dxq=falloc(c->hidden/32 + 1);                       /* activation block scales */
+    float *dgq=falloc((int64_t)c->topk*(c->moe_inter/32 + 1));
     int e_idot = g_idot && g_expert_idot && m->e_int4;
     for(int l=0;l<c->n_layers;l++){ Layer *L=&m->L[l];
         { PT_T0; for(int s=0;s<S;s++) rmsnorm(nrm+(size_t)s*D, x+(size_t)s*D, L->in_ln, D, c->eps); PT_ADD(p_norm); }
         attention(m,L,l,nrm,S,pos_base,att);
-        { PT_T0; qmatmul_ex(ao, att, &L->o, S, H*hd, D, g_attn_idot?2:0); PT_ADD(p_oproj); }
+        { PT_T0;
+          qmatmul_ex(ao, att, &L->o, S, H*hd, D, g_attn_idot?2:0);
+          PT_ADD(p_oproj); }
         for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=ao[j];
         for(int s=0;s<S;s++){
             float *xn=nrm+(size_t)s*D; rmsnorm(xn, x+(size_t)s*D, L->post_ln, D, c->eps);
@@ -683,7 +873,9 @@ static void step(Model *m, const int *ids, int S, int pos_base, float *logits, i
             for(int kk=0;kk<c->topk;kk++) sl[kk]=expert_get(m,l,idx[kk]);
             double _e1 = g_profile ? now_s() : 0.0;
             if(g_profile) p_expload += _e1-_e0;
-            if(e_idot) experts_fused(m,sl,c->topk,xq,sx,wsel,moe,gga,uua,gqa,dna,sga);
+            if(m->e_q4k) experts_q4k(m,sl,c->topk,xn,wsel,moe,gga,uua,dna,
+                                     m->e_down_q6[l]?GGUF_Q6_K:GGUF_Q4_K,xq,dxq,gqa,dgq);
+            else if(e_idot) experts_fused(m,sl,c->topk,xq,sx,wsel,moe,gga,uua,gqa,dna,sga);
             else for(int kk=0;kk<c->topk;kk++)
                      expert_apply(m,sl[kk],xn,xq,sx,wsel[kk],moe,gg,uu,dn,gq,0);
             if(g_profile) p_expmm += now_s()-_e1;
@@ -696,7 +888,7 @@ static void step(Model *m, const int *ids, int S, int pos_base, float *logits, i
         { PT_T0; qmatmul(logits+(size_t)(want_all?s:0)*c->vocab, xn, &m->lm_head, 1, D, c->vocab); PT_ADD(p_head); }
     }
     free(x);free(nrm);free(att);free(ao);free(rl);free(gg);free(uu);free(dn);free(moe);free(xq);free(gq);
-    free(sl);free(gga);free(uua);free(dna);free(sga);free(gqa);
+    free(sl);free(gga);free(uua);free(dna);free(sga);free(gqa);free(dxq);free(dgq);
 }
 
 static void kv_alloc(Model *m, int max_t){
@@ -846,10 +1038,15 @@ static void run_gen(Model *m, const char *snap, const char *prompt, int ntok){
 }
 
 /* ---------- ppl: teacher-forcing NLL, llama-perplexity window ----------
- * Their canon (perplexity.cpp, stride 0): the token stream is cut into non-overlapping
- * chunks of n_ctx (default 512), each chunk is evaluated in one pass, and the loss is
- * summed over positions 1..n_ctx-1 — the first token of a chunk has no prediction, so a
- * chunk contributes n_ctx-1 terms. PPL = exp(sum NLL / count).
+ * Their canon (perplexity.cpp:532-542, stride 0): the stream is cut into non-overlapping
+ * chunks of n_ctx (default 512), each chunk is evaluated in one pass, and the loss is summed
+ * ONLY OVER THE SECOND HALF of the window —
+ *     "calculate the perplexity over the last half of the window
+ *      (so the model always has some context to predict the token)"
+ *     const int first = n_ctx/2;
+ * so a chunk contributes n_ctx/2 - 1 terms, not n_ctx - 1. Scoring the first half too — as
+ * this code did until T5f — charges the model for tokens it had almost no context for and
+ * inflates PPL, which made every earlier number here incomparable with the oracle column.
  * NLL accumulates in float64 and log-sum-exp is computed in float64: at ~150k logits per
  * position and hundreds of thousands of terms, f32 accumulation drifts (the cos>1 lesson). */
 static void run_ppl(Model *m, const char *snap, const char *path, int nctx, int maxchunks){
@@ -874,7 +1071,7 @@ static void run_ppl(Model *m, const char *snap, const char *path, int nctx, int 
         const int *win=ids+(size_t)ch*nctx;
         kv_free(m); kv_alloc(m,nctx+2);            /* each chunk is independent context */
         step(m,win,nctx,0,lg,1);
-        for(int i=0;i+1<nctx;i++){
+        for(int i=nctx/2;i+1<nctx;i++){          /* second half only — their window */
             const float *row=lg+(size_t)i*c->vocab;
             int tgt=win[i+1];
             double mx=-1e300;
